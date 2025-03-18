@@ -5,19 +5,19 @@ on:
     branches: [ main ]
     paths:
       - '.devcontainer/**'
-    # 添加排除条件，避免重复触发
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:
-  build-and-push:
-    # 添加条件确保只运行一次
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+  docker:
+    name: Build and Push Docker Image
     runs-on: ubuntu-latest
     environment: docker-publish
-    # 添加并发控制
+    # 添加这个标记，表明这是独立的工作流
+    permissions:
+      contents: read
+      packages: write
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
