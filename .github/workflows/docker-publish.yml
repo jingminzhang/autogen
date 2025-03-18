@@ -12,9 +12,11 @@ on:
 jobs:
   docker:
     name: Build and Push Docker Image
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: docker-publish
-    # 添加这个标记，表明这是独立的工作流
     permissions:
       contents: read
       packages: write
