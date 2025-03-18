@@ -1,12 +1,17 @@
 #!/bin/bash
 
+# Install git-lfs
+sudo apt-get update
+sudo apt-get install -y git-lfs
+
+# Install yarn
+npm install -g yarn
+
 # Create the node_modules directory in the frontend folder if it doesn't exist
-# This ensures the directory exists before mounting
 mkdir -p frontend/node_modules
 
-# Change ownership of node_modules to vscode user
-# This prevents permission issues when installing packages
-sudo chown vscode frontend/node_modules 
+# Change ownership of node_modules to current user instead of vscode
+sudo chown $USER frontend/node_modules 
 
 # Initialize git-lfs and fetch/checkout LFS files
 git lfs install
