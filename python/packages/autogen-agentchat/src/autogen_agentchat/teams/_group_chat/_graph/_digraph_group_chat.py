@@ -1,8 +1,9 @@
 import asyncio
-from typing import Any, Callable, Dict, List, Literal, Mapping, Sequence, Set
+from collections import Counter, deque
+from typing import Any, Callable, Deque, Dict, List, Literal, Mapping, Sequence, Set, Union
 
 from autogen_core import AgentRuntime, CancellationToken, Component, ComponentModel
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from typing_extensions import Self
 
 from autogen_agentchat.agents import BaseChatAgent
@@ -33,15 +34,73 @@ class DiGraphEdge(BaseModel):
 
         This is an experimental feature, and the API will change in the future releases.
 
+    .. warning::
+
+        If the condition is a callable, it will not be serialized in the model.
+
     """
 
     target: str  # Target node name
-    condition: str | None = None  # Optional execution condition (trigger-based)
+    condition: Union[str, Callable[[BaseChatMessage], bool], None] = Field(default=None)
     """(Experimental) Condition to execute this edge.
-    If None, the edge is unconditional. If a string, the edge is conditional on the presence of that string in the last agent chat message.
-    NOTE: This is an experimental feature WILL change in the future releases to allow for better spcification of branching conditions
-    similar to the `TerminationCondition` class.
+    If None, the edge is unconditional.
+    If a string, the edge is conditional on the presence of that string in the last agent chat message.
+    If a callable, the edge is conditional on the callable returning True when given the last message.
     """
+
+    # Using Field to exclude the condition in serialization if it's a callable
+    condition_function: Callable[[BaseChatMessage], bool] | None = Field(default=None, exclude=True)
+    activation_group: str = Field(default="")
+    """Group identifier for forward dependencies.
+
+    When multiple edges point to the same target node, they are grouped by this field.
+    This allows distinguishing between different cycles or dependency patterns.
+
+    Example: In a graph containing a cycle like A->B->C->B, the two edges pointing to B (A->B and C->B)
+    can be in different activation groups to control how B is activated.
+    Defaults to the target node name if not specified.
+    """
+    activation_condition: Literal["all", "any"] = "all"
+    """Determines how forward dependencies within the same activation_group are evaluated.
+
+    - "all": All edges in this activation group must be satisfied before the target node can execute
+    - "any": Any single edge in this activation group being satisfied allows the target node to execute
+
+    This is used to handle complex dependency patterns in cyclic graphs where multiple
+    paths can lead to the same target node.
+    """
+
+    @model_validator(mode="after")
+    def _validate_condition(self) -> "DiGraphEdge":
+        # Store callable in a separate field and set condition to None for serialization
+        if callable(self.condition):
+            self.condition_function = self.condition
+            # For serialization purposes, we'll set the condition to None
+            # when storing as a pydantic model/dict
+            object.__setattr__(self, "condition", None)
+
+        # Set activation_group to target if not already set
+        if not self.activation_group:
+            self.activation_group = self.target
+
+        return self
+
+    def check_condition(self, message: BaseChatMessage) -> bool:
+        """Check if the edge condition is satisfied for the given message.
+
+        Args:
+            message: The message to check the condition against.
+
+        Returns:
+            True if condition is satisfied (None condition always returns True),
+            False otherwise.
+        """
+        if self.condition_function is not None:
+            return self.condition_function(message)
+        elif isinstance(self.condition, str):
+            # If it's a string, check if the string is in the message content
+            return self.condition in message.to_model_text()
+        return True  # None condition is always satisfied
 
 
 class DiGraphNode(BaseModel):
@@ -124,7 +183,7 @@ class DiGraph(BaseModel):
                     cycle_edges: List[DiGraphEdge] = []
                     for n in cycle_nodes:
                         cycle_edges.extend(self.nodes[n].edges)
-                    if not any(edge.condition for edge in cycle_edges):
+                    if all(edge.condition is None and edge.condition_function is None for edge in cycle_edges):
                         raise ValueError(
                             f"Cycle detected without exit condition: {' -> '.join(cycle_nodes + cycle_nodes[:1])}"
                         )
@@ -163,12 +222,85 @@ class DiGraph(BaseModel):
         # Outgoing edge condition validation (per node)
         for node in self.nodes.values():
             # Check that if a node has an outgoing conditional edge, then all outgoing edges are conditional
-            has_condition = any(edge.condition for edge in node.edges)
-            has_unconditioned = any(edge.condition is None for edge in node.edges)
+            has_condition = any(
+                edge.condition is not None or edge.condition_function is not None for edge in node.edges
+            )
+            has_unconditioned = any(edge.condition is None and edge.condition_function is None for edge in node.edges)
             if has_condition and has_unconditioned:
                 raise ValueError(f"Node '{node.name}' has a mix of conditional and unconditional edges.")
 
+        # Validate activation conditions across all edges in the graph
+        self._validate_activation_conditions()
+
         self._has_cycles = self.has_cycles_with_exit()
+
+    def _validate_activation_conditions(self) -> None:
+        """Validate that all edges pointing to the same target node have consistent activation_condition values.
+
+        Raises:
+            ValueError: If edges pointing to the same target have different activation_condition values
+        """
+        target_activation_conditions: Dict[str, Dict[str, str]] = {}  # target_node -> {activation_group -> condition}
+
+        for node in self.nodes.values():
+            for edge in node.edges:
+                target = edge.target  # The target node this edge points to
+                activation_group = edge.activation_group
+
+                if target not in target_activation_conditions:
+                    target_activation_conditions[target] = {}
+
+                if activation_group in target_activation_conditions[target]:
+                    if target_activation_conditions[target][activation_group] != edge.activation_condition:
+                        # Find the source node that has the conflicting condition
+                        conflicting_source = self._find_edge_source_by_target_and_group(
+                            target, activation_group, target_activation_conditions[target][activation_group]
+                        )
+                        raise ValueError(
+                            f"Conflicting activation conditions for target '{target}' group '{activation_group}': "
+                            f"'{target_activation_conditions[target][activation_group]}' (from node '{conflicting_source}') "
+                            f"and '{edge.activation_condition}' (from node '{node.name}')"
+                        )
+                else:
+                    target_activation_conditions[target][activation_group] = edge.activation_condition
+
+    def _find_edge_source_by_target_and_group(
+        self, target: str, activation_group: str, activation_condition: str
+    ) -> str:
+        """Find the source node that has an edge pointing to the given target with the given activation_group and activation_condition."""
+        for node_name, node in self.nodes.items():
+            for edge in node.edges:
+                if (
+                    edge.target == target
+                    and edge.activation_group == activation_group
+                    and edge.activation_condition == activation_condition
+                ):
+                    return node_name
+        return "unknown"
+
+    def get_remaining_map(self) -> Dict[str, Dict[str, int]]:
+        """Get the remaining map that tracks how many edges point to each target node with each activation group.
+
+        Returns:
+            Dictionary mapping target nodes to their activation groups and remaining counts
+        """
+
+        remaining_map: Dict[str, Dict[str, int]] = {}
+
+        for node in self.nodes.values():
+            for edge in node.edges:
+                target = edge.target
+                activation_group = edge.activation_group
+
+                if target not in remaining_map:
+                    remaining_map[target] = {}
+
+                if activation_group not in remaining_map[target]:
+                    remaining_map[target][activation_group] = 0
+
+                remaining_map[target][activation_group] += 1
+
+        return remaining_map
 
 
 class GraphFlowManagerState(BaseGroupChatManagerState):
@@ -208,154 +340,140 @@ class GraphFlowManager(BaseGroupChatManager):
             max_turns=max_turns,
             message_factory=message_factory,
         )
-        self._graph = graph
-        self._graph.graph_validate()
-        self._graph_has_cycles = self._graph.get_has_cycles()
-        if self._graph_has_cycles and self._termination_condition is None and self._max_turns is None:
+        graph.graph_validate()
+        if graph.get_has_cycles() and self._termination_condition is None and self._max_turns is None:
             raise ValueError("A termination condition is required for cyclic graphs without a maximum turn limit.")
+        self._graph = graph
+        # Lookup table for incoming edges for each node.
+        self._parents = graph.get_parents()
+        # Lookup table for outgoing edges for each node.
+        self._edges: Dict[str, List[DiGraphEdge]] = {n: node.edges for n, node in graph.nodes.items()}
 
-        self._use_default_start = self._graph.default_start_node is not None
-        self._default_start_executed = False
-        self._start_nodes = graph.get_start_nodes()
-        self._leaf_nodes = graph.get_leaf_nodes()
-        self._parents = graph.get_parents()  # Parent node dependencies - helper dict to get all incoming edges
-        self._active_nodes: Set[str] = set()  # Currently executing nodes
-        self._active_node_count: Dict[str, int] = {
-            node: 0 for node in graph.nodes
-        }  # Number of times a node has been active
+        # Build activation and enqueued_any lookup tables by collecting all edges and grouping by target node
+        self._build_lookup_tables(graph)
 
-        # These are nodes next in line for execution as one or more of their parent nodes have started execution.
-        # They execute when all their parent nodes have executed.
-        # Nodes are added to this dict when at least one of their parent nodes becomes active.
-        # Start nodes (no parents) are added to this dict at initialization as they are always ready to run.
-        self._pending_execution: Dict[str, List[str]] = {node: [] for node in graph.get_start_nodes()}
+        # Track which activation groups were triggered for each node
+        self._triggered_activation_groups: Dict[str, Set[str]] = {}
+        # === Mutable states for the graph execution ===
+        # Count the number of remaining parents to activate each node.
+        self._remaining: Dict[str, Counter[str]] = {
+            target: Counter(groups) for target, groups in graph.get_remaining_map().items()
+        }
+        # cache for remaining
+        self._origin_remaining: Dict[str, Dict[str, int]] = {
+            target: Counter(groups) for target, groups in self._remaining.items()
+        }
 
-    def _get_valid_target(self, node: DiGraphNode, content: str) -> str:
-        """Check if a condition is met in the chat history."""
-        for edge in node.edges:
-            if edge.condition and edge.condition in content:
-                return edge.target
+        # Ready queue for nodes that are ready to execute, starting with the start nodes.
+        self._ready: Deque[str] = deque([n for n in graph.get_start_nodes()])
 
-        raise RuntimeError(f"Condition not met for node {node.name}. Content: {content}")
+    def _build_lookup_tables(self, graph: DiGraph) -> None:
+        """Build activation and enqueued_any lookup tables by collecting all edges and grouping by target node.
 
-    def _is_node_ready(self, node_name: str) -> bool:
-        """Check if a node is ready to execute based on its parent nodes.
-        If activation is any then execute as soon as any parent has finished
-        If activation is all then execute only when all parents have finished
+        Args:
+            graph: The directed graph
         """
-        node = self._graph.nodes[node_name]
-        if node.activation == "any":
-            return bool(self._pending_execution[node_name])
-        return all(parent in self._pending_execution[node_name] for parent in self._parents[node_name])
+        self._activation: Dict[str, Dict[str, Literal["any", "all"]]] = {}
+        self._enqueued_any: Dict[str, Dict[str, bool]] = {}
 
-    async def _select_speakers(self, thread: List[BaseAgentEvent | BaseChatMessage], many: bool = True) -> List[str]:
-        """Select the next set of agents to execute based on DAG constraints."""
-        next_speakers: Set[str] = set()
-        source_node: DiGraphNode | None = None
-        source: str | None = None
+        for node in graph.nodes.values():
+            for edge in node.edges:
+                target = edge.target
+                activation_group = edge.activation_group
 
-        if thread and isinstance(thread[-1], BaseChatMessage):
-            source = thread[-1].source  # name of the agent that just finished
-            content = thread[-1].to_model_text()
+                # Build activation lookup
+                if target not in self._activation:
+                    self._activation[target] = {}
+                if activation_group not in self._activation[target]:
+                    self._activation[target][activation_group] = edge.activation_condition
 
-            # Safety check: only an active node can send a response
-            if source != "user":
-                if source not in self._active_nodes:
-                    raise RuntimeError(f"Agent '{source}' is not currently active.")
+                # Build enqueued_any lookup
+                if target not in self._enqueued_any:
+                    self._enqueued_any[target] = {}
+                if activation_group not in self._enqueued_any[target]:
+                    self._enqueued_any[target][activation_group] = False
 
-                # Mark the node as no longer active (it just finished)
-                self._active_node_count[source] -= 1
+    async def update_message_thread(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> None:
+        await super().update_message_thread(messages)
 
-                if self._active_node_count[source] <= 0:
-                    self._active_nodes.remove(source)
+        # Find the node that ran in the current turn.
+        message = messages[-1]
+        if message.source not in self._graph.nodes:
+            # Ignore messages from sources outside of the graph.
+            return
+        assert isinstance(message, BaseChatMessage)
+        source = message.source
 
-                source_node = self._graph.nodes[source]
+        # Propagate the update to the children of the node.
+        for edge in self._edges[source]:
+            # Use the new check_condition method that handles both string and callable conditions
+            if not edge.check_condition(message):
+                continue
 
-                if source_node.edges:
-                    # Case: conditional edges — only execute if condition is met
-                    target_nodes_names: List[str] = []
-                    if source_node.edges[0].condition is not None:
-                        target_nodes_names = [self._get_valid_target(source_node, content)]
-                        other_nodes = [
-                            edge.target for edge in source_node.edges if edge.target != target_nodes_names[0]
-                        ]
-                        for other_node in other_nodes:
-                            other_active_parents = [
-                                parent
-                                for parent in self._parents[other_node]
-                                if (parent != source and parent in self._active_nodes)
-                            ]
-                            if not other_active_parents:
-                                self._pending_execution.pop(other_node)
-                            else:
-                                self._pending_execution[other_node] = other_active_parents
+            target = edge.target
+            activation_group = edge.activation_group
 
-                    else:
-                        # Case: unconditional edges — mark this source as completed for all its children
-                        target_nodes_names = [edge.target for edge in source_node.edges]
-
-                    for target in target_nodes_names:
-                        self._pending_execution[target].append(source)
+            if self._activation[target][activation_group] == "all":
+                self._remaining[target][activation_group] -= 1
+                if self._remaining[target][activation_group] == 0:
+                    # If all parents are done, add to the ready queue.
+                    self._ready.append(target)
+                    # Track which activation group was triggered
+                    self._save_triggered_activation_group(target, activation_group)
             else:
-                # TODO: Check if there are any usecase where the User can decide on the next speaker
-                pass
+                # If activation is any, add to the ready queue if not already enqueued.
+                if not self._enqueued_any[target][activation_group]:
+                    self._ready.append(target)
+                    self._enqueued_any[target][activation_group] = True
+                    # Track which activation group was triggered
+                    self._save_triggered_activation_group(target, activation_group)
 
-        # After updating _pending_execution, check which nodes are now unblocked
-        for node_name in list(self._pending_execution):
-            if self._use_default_start and not self._default_start_executed:
-                if node_name == self._graph.default_start_node:
-                    next_speakers.add(node_name)
-                    self._default_start_executed = True
-                    break
+    def _save_triggered_activation_group(self, target: str, activation_group: str) -> None:
+        """Save which activation group was triggered for a target node.
 
-            if self._is_node_ready(node_name):
-                next_speakers.add(node_name)
-                node = self._graph.nodes[node_name]
-                if node.activation == "all":
-                    self._pending_execution.pop(node_name)
-                else:
-                    # If activation is any, remove the parent that just finished
-                    if source is not None:
-                        self._pending_execution[node_name] = [
-                            parent for parent in self._pending_execution[node_name] if parent != source
-                        ]
+        Args:
+            target: The target node that was triggered
+            activation_group: The activation group that caused the trigger
+        """
+        if target not in self._triggered_activation_groups:
+            self._triggered_activation_groups[target] = set()
+        self._triggered_activation_groups[target].add(activation_group)
 
-                    # If none of the other parents of this node are active, remove this node from pending execution
-                    node_parents = self._parents[node_name]
-                    if not any(parent in self._active_nodes for parent in node_parents):
-                        self._pending_execution.pop(node_name)
+    def _reset_triggered_activation_groups(self, speaker: str) -> None:
+        """Reset the bookkeeping for the specific activation groups that were triggered for a speaker.
 
-                if not many:
-                    break
+        Args:
+            speaker: The speaker node to reset activation groups for
+        """
+        if speaker not in self._triggered_activation_groups:
+            return
 
-        # Prepopulate children of next_speakers into _pending_execution
-        for node_name in next_speakers:
-            for edge in self._graph.nodes[node_name].edges:
-                if edge.target not in self._pending_execution:
-                    self._pending_execution[edge.target] = []
+        for activation_group in self._triggered_activation_groups[speaker]:
+            if self._activation[speaker][activation_group] == "any":
+                self._enqueued_any[speaker][activation_group] = False
+            else:
+                # Reset the remaining count for this activation group using the graph's original count
+                if speaker in self._remaining and activation_group in self._remaining[speaker]:
+                    self._remaining[speaker][activation_group] = self._origin_remaining[speaker][activation_group]
 
-        # Mark newly selected speakers as active
-        for speaker in next_speakers:
-            if speaker not in self._active_nodes:
-                self._active_nodes.add(speaker)
+        # Clear the triggered activation groups for this speaker
+        self._triggered_activation_groups[speaker].clear()
 
-            self._active_node_count[speaker] += 1
+    async def select_speaker(self, thread: Sequence[BaseAgentEvent | BaseChatMessage]) -> List[str]:
+        # Drain the ready queue for the next set of speakers.
+        speakers: List[str] = []
+        while self._ready:
+            speaker = self._ready.popleft()
+            speakers.append(speaker)
 
-        if not self._pending_execution and not next_speakers and not self._active_nodes:
-            next_speakers = set([_DIGRAPH_STOP_AGENT_NAME])  # Call the termination agent
+            # Reset the bookkeeping for the specific activation groups that were triggered
+            self._reset_triggered_activation_groups(speaker)
 
-        return list(next_speakers)
-
-    async def select_speakers(self, thread: List[BaseAgentEvent | BaseChatMessage]) -> List[str]:
-        return await self._select_speakers(thread)
-
-    async def select_speaker(self, thread: List[BaseAgentEvent | BaseChatMessage]) -> str:
-        """Select a speaker from the participants and return the
-        topic type of the selected speaker."""
-        speakers = await self._select_speakers(thread, many=False)
+        # If there are no speakers, trigger the stop agent.
         if not speakers:
-            raise RuntimeError("No available speakers found.")
-        return speakers[0]
+            speakers = [_DIGRAPH_STOP_AGENT_NAME]
+
+        return speakers
 
     async def validate_group_state(self, messages: List[BaseChatMessage] | None) -> None:
         pass
@@ -365,10 +483,9 @@ class GraphFlowManager(BaseGroupChatManager):
         state = {
             "message_thread": [message.dump() for message in self._message_thread],
             "current_turn": self._current_turn,
-            "active_nodes": list(self._active_nodes),
-            "pending_execution": self._pending_execution,
-            "active_node_count": self._active_node_count,
-            "default_start_executed": self._default_start_executed,
+            "remaining": {target: dict(counter) for target, counter in self._remaining.items()},
+            "enqueued_any": dict(self._enqueued_any),
+            "ready": list(self._ready),
         }
         return state
 
@@ -376,10 +493,9 @@ class GraphFlowManager(BaseGroupChatManager):
         """Restore execution state from saved data."""
         self._message_thread = [self._message_factory.create(msg) for msg in state["message_thread"]]
         self._current_turn = state["current_turn"]
-        self._active_nodes = set(state["active_nodes"])
-        self._pending_execution = state["pending_execution"]
-        self._active_node_count = state["active_node_count"]
-        self._default_start_executed = state.get("default_start_executed", False)
+        self._remaining = {target: Counter(groups) for target, groups in state["remaining"].items()}
+        self._enqueued_any = state["enqueued_any"]
+        self._ready = deque(state["ready"])
 
     async def reset(self) -> None:
         """Reset execution state to the start of the graph."""
@@ -387,11 +503,9 @@ class GraphFlowManager(BaseGroupChatManager):
         self._message_thread.clear()
         if self._termination_condition:
             await self._termination_condition.reset()
-
-        self._active_nodes = set()
-        self._active_node_count = {node: 0 for node in self._graph.nodes}
-        self._pending_execution = {node: [] for node in self._start_nodes}
-        self._default_start_executed = False
+        self._remaining = {target: Counter(groups) for target, groups in self._graph.get_remaining_map().items()}
+        self._enqueued_any = {n: {g: False for g in self._enqueued_any[n]} for n in self._enqueued_any}
+        self._ready = deque([n for n in self._graph.get_start_nodes()])
 
 
 class _StopAgent(BaseChatAgent):
@@ -446,6 +560,11 @@ class GraphFlow(BaseGroupChat, Component[GraphFlowConfig]):
         for adding nodes and edges, setting entry points, and validating the graph structure.
         See the :class:`DiGraphBuilder` documentation for more details.
         The :class:`GraphFlow` class is designed to be used with the :class:`DiGraphBuilder` for creating complex workflows.
+
+    .. warning::
+
+        When using callable conditions in edges, they will not be serialized
+        when calling :meth:`dump_component`. This will be addressed in future releases.
 
 
     Args:
@@ -537,7 +656,7 @@ class GraphFlow(BaseGroupChat, Component[GraphFlowConfig]):
 
             asyncio.run(main())
 
-        **Conditional Branching: A → B (if 'yes') or C (if 'no')**
+        **Conditional Branching: A → B (if 'yes') or C (otherwise)**
 
         .. code-block:: python
 
@@ -560,11 +679,12 @@ class GraphFlow(BaseGroupChat, Component[GraphFlowConfig]):
                 agent_b = AssistantAgent("B", model_client=model_client, system_message="Translate input to English.")
                 agent_c = AssistantAgent("C", model_client=model_client, system_message="Translate input to Chinese.")
 
-                # Create a directed graph with conditional branching flow A -> B ("yes"), A -> C ("no").
+                # Create a directed graph with conditional branching flow A -> B ("yes"), A -> C (otherwise).
                 builder = DiGraphBuilder()
                 builder.add_node(agent_a).add_node(agent_b).add_node(agent_c)
-                builder.add_edge(agent_a, agent_b, condition="yes")
-                builder.add_edge(agent_a, agent_c, condition="no")
+                # Create conditions as callables that check the message content.
+                builder.add_edge(agent_a, agent_b, condition=lambda msg: "yes" in msg.to_model_text())
+                builder.add_edge(agent_a, agent_c, condition=lambda msg: "yes" not in msg.to_model_text())
                 graph = builder.build()
 
                 # Create a GraphFlow team with the directed graph.
@@ -581,7 +701,7 @@ class GraphFlow(BaseGroupChat, Component[GraphFlowConfig]):
 
             asyncio.run(main())
 
-        **Loop with exit condition: A → B → C (if 'APPROVE') or A (if 'REJECT')**
+        **Loop with exit condition: A → B → C (if 'APPROVE') or A (otherwise)**
 
         .. code-block:: python
 
@@ -605,17 +725,21 @@ class GraphFlow(BaseGroupChat, Component[GraphFlowConfig]):
                     "B",
                     model_client=model_client,
                     system_message="Provide feedback on the input, if your feedback has been addressed, "
-                    "say 'APPROVE', else say 'REJECT' and provide a reason.",
+                    "say 'APPROVE', otherwise provide a reason for rejection.",
                 )
                 agent_c = AssistantAgent(
                     "C", model_client=model_client, system_message="Translate the final product to Korean."
                 )
 
-                # Create a loop graph with conditional exit: A -> B -> C ("APPROVE"), B -> A ("REJECT").
+                # Create a loop graph with conditional exit: A -> B -> C ("APPROVE"), B -> A (otherwise).
                 builder = DiGraphBuilder()
                 builder.add_node(agent_a).add_node(agent_b).add_node(agent_c)
                 builder.add_edge(agent_a, agent_b)
-                builder.add_conditional_edges(agent_b, {"APPROVE": agent_c, "REJECT": agent_a})
+
+                # Create conditional edges using strings
+                builder.add_edge(agent_b, agent_c, condition=lambda msg: "APPROVE" in msg.to_model_text())
+                builder.add_edge(agent_b, agent_a, condition=lambda msg: "APPROVE" not in msg.to_model_text())
+
                 builder.set_entry_point(agent_a)
                 graph = builder.build()
 
